@@ -1,8 +1,13 @@
+import re
 import os
 import sys
+import time
+import threading
+import queue
 from datetime import datetime
 from pathlib import Path
 from typing import Union
+import logging
 
 import matplotlib.pyplot as plt
 import numpy as np
@@ -10,6 +15,82 @@ import torch
 from numpy import array
 from omegaconf import OmegaConf
 from torchtyping import TensorType
+
+
+
+class AsyncMLFlowLogger:
+    def __init__(self, flush_interval=2):
+        import mlflow
+        self.mlflow = mlflow
+        self.flush_interval = flush_interval
+        self.queue = queue.Queue()
+        self.stop_flag = False
+        self.thread = threading.Thread(target=self.worker, daemon=True)
+        self.thread.start()
+
+        # dynamic logging control
+        self.target_queue = 50
+        self._block_steps = set()
+        self._last_seen_step = -1
+
+
+    def should_log(self, step):
+        """Keep track of the time between steps and adust logging frequency to skip steps to keep pace. If a step value is skipped, all subsequent calls with the same step should also be skipped."""
+        if step is None:
+            raise ValueError("Step must be provided for logging.")
+        
+        if step in self._block_steps:
+            return False
+        
+        if step <=1:
+            return True
+                
+        if step > self._last_seen_step:
+            self._last_seen_step = step
+
+            current_queue_size = self.queue.qsize()
+            if current_queue_size > self.target_queue:
+                self._block_steps.add(step)
+                return False
+        
+        return True
+        
+
+    
+    def clean(self, s):
+        return re.sub(r"[^a-zA-Z0-9_\-\. :/]", "", s)
+
+
+    def worker(self):
+        while not self.stop_flag:
+            try:
+                func, args, kwargs = self.queue.get(timeout=self.flush_interval)
+                func(*args, **kwargs)
+            except queue.Empty:
+                pass
+
+    def log_metric(self, key, value, step=None):
+        if self.should_log(step):
+            key = self.clean(key)
+            self.queue.put((self.mlflow.log_metric, (key, value), {"step": step}))
+
+    def log_param(self, key, value):
+        key = self.clean(key)
+        self.queue.put((self.mlflow.log_param, (key, value), {}))
+
+    def close(self):
+        self.stop_flag = True
+        self.thread.join()
+    
+    def catch_up(self):
+        return 
+        """Block until the queue is empty (flush pending logs)."""
+        while not self.queue.empty():
+            try:
+                func, args, kwargs = self.queue.get_nowait()
+                func(*args, **kwargs)
+            except queue.Empty:
+                break
 
 
 class Logger:
@@ -72,6 +153,30 @@ class Logger:
             date_time = datetime.today().strftime("%d/%m-%H:%M:%S")
             run_name = f"{run_name} {date_time}"
 
+        # MLflow support
+        self.mlflow = None
+        self.mlflow_run = None
+        if hasattr(self.do, "mlflow") and self.do.mlflow:
+            try:
+                import mlflow
+                self.mlflow = mlflow
+                self.mlflow.set_tracking_uri(self.do.mlflow.get("tracking_uri", ""))
+                self.mlflow.set_experiment(project_name)
+                self.mlflow_run = self.mlflow.start_run(run_name=run_name)
+                self.mlflow_logger = AsyncMLFlowLogger()
+
+                # Log config as params
+                for k, v in config.items():
+                    if isinstance(v, dict):
+                        for kk, vv in v.items():
+                            self.mlflow_logger.log_param(f"{k}.{kk}", vv)
+                    else:
+                        self.mlflow_logger.log_param(k, v)
+            except Exception as e:
+                print(f"MLflow init failed: {e}")
+                self.mlflow = None
+                self.mlflow_run = None
+
         if self.do.online:
             import wandb
 
@@ -101,6 +206,7 @@ class Logger:
         else:
             self.wandb = None
             self.run = None
+
         self.add_tags(tags)
         self.context = context
         self.progressbar = progressbar
@@ -140,7 +246,8 @@ class Logger:
     def add_tags(self, tags: list):
         if not self.do.online:
             return
-        self.run.tags = self.run.tags + tags
+        if tags:
+            self.run.tags = self.run.tags + tags
 
     def set_context(self, context: int):
         self.context = str(context)
@@ -161,37 +268,56 @@ class Logger:
         pbar.set_description(description)
 
     def log_histogram(self, key, value, step, use_context=True):
-        if not self.do.online:
-            return
-        if use_context:
-            key = self.context + "/" + key
-        fig = plt.figure()
-        plt.hist(value)
-        plt.title(key)
-        plt.ylabel("Frequency")
-        plt.xlabel(key)
-        fig = self.wandb.Image(fig)
-        self.wandb.log({key: fig}, step)
+        # Log to wandb
+        if self.do.online:
+            if use_context:
+                key = self.context + "/" + key
+            fig = plt.figure()
+            plt.hist(value)
+            plt.title(key)
+            plt.ylabel("Frequency")
+            plt.xlabel(key)
+            figimg = self.wandb.Image(fig)
+            self.wandb.log({key: figimg}, step)
+            plt.close(fig)
+        # Log to MLflow
+        if self.mlflow is not None:
+            fig = plt.figure()
+            plt.hist(value)
+            plt.title(key)
+            plt.ylabel("Frequency")
+            plt.xlabel(key)
+            img_path = self.logdir / f"{key}_hist_step{step}.png"
+            fig.savefig(img_path)
+            self.mlflow.log_artifact(str(img_path))
+            plt.close(fig)
 
     def log_plots(self, figs: Union[dict, list], step, use_context=True):
-        if not self.do.online:
-            self.close_figs(figs)
-            return
+        keys = None
         if isinstance(figs, dict):
-            keys = figs.keys()
+            keys = list(figs.keys())
             figs = list(figs.values())
         else:
             assert isinstance(figs, list), "figs must be a list or a dict"
             keys = [f"Figure {i} at step {step}" for i in range(len(figs))]
 
-        for key, fig in zip(keys, figs):
-            if use_context:  # fixme
-                context = self.context + "/" + key
-            if fig is not None:
-                figimg = self.wandb.Image(fig)
-                self.wandb.log({key: figimg}, step)
-
-        self.close_figs(figs)
+        # Log to wandb
+        if self.do.online:
+            for key, fig in zip(keys, figs):
+                log_key = self.context + "/" + key if use_context else key
+                if fig is not None:
+                    figimg = self.wandb.Image(fig)
+                    self.wandb.log({log_key: figimg}, step)
+            self.close_figs(figs)
+        # Log to MLflow
+        if self.mlflow is not None:
+            for key, fig in zip(keys, figs):
+                log_key = self.context + "/" + key if use_context else key
+                if fig is not None:
+                    img_path = self.logdir / f"{log_key}_step{step}.png"
+                    fig.savefig(img_path)
+                    self.mlflow.log_artifact(str(img_path))
+            self.close_figs(figs)
 
     def close_figs(self, figs: list):
         for fig in figs:
@@ -209,25 +335,7 @@ class Logger:
     ):
         """
         Logs the rewards, log-rewards and proxy scores passed as arguments.
-
-        Parameters
-        ----------
-        rewards : tensor
-            Rewards of a batch of states.
-        logrewards : tensor
-            Log-rewards of a batch of states.
-        scores : tensor
-            Proxy scores of a batch of states.
-        step : int
-            The training iteration number.
-        prefix : str
-            Prefix to be added to the metric names.
-        use_context : bool
-            If True, prepend self.context + / to the key of the metric.
         """
-        if not self.do.online:
-            return
-
         metrics = {
             f"{prefix} rewards mean": rewards.mean(),
             f"{prefix} rewards max": rewards.max(),
@@ -242,7 +350,6 @@ class Logger:
                     f"{prefix} scores max": scores.max(),
                 }
             )
-
         self.log_metrics(metrics, step=step, use_context=use_context)
 
     def log_metrics(
@@ -251,36 +358,47 @@ class Logger:
         step: int,
         use_context: bool = True,
     ):
+        
         """
-        Logs metrics to wandb.
-
-        Parameters
-        ----------
-        metrics : dict
-            A dictionary of metrics to be logged to wandb.
-        step : int
-            The training iteration number.
-        use_context : bool
-            If True, prepend self.context + / to the key of the metric.
+        Logs metrics to wandb and/or MLflow.
         """
-        if not self.do.online:
-            return
 
-        for key, value in metrics.items():
-            # Append context
-            if use_context:
-                key = self.context + "/" + key
 
-            # Ignore if value is None
-            if value is None:
-                continue
-
-            self.wandb.log({key: value}, step=step)
+        # Log to wandb
+        if self.do.online:
+            for key, value in metrics.items():
+                log_key = self.context + "/" + key if use_context else key
+                if value is None:
+                    continue
+                self.wandb.log({log_key: value}, step=step)
+        # Log to MLflow
+        if self.mlflow is not None:
+            if step % self.do.mlflow.get('sync_interval', 1000) == 0 and step > 0: 
+                #Allow the mlflow logger to catch up every sync_interval steps
+                self.mlflow_logger.catch_up()
+                 
+            for key, value in metrics.items():
+                log_key = self.context + "/" + key if use_context else key
+                if value is None:
+                    continue
+                try:
+                    self.mlflow_logger.log_metric(log_key, float(value), step=step)
+                except Exception as e:
+                    if self.debug:
+                        print(f"MLflow log_metric failed for {log_key}: {e}")
 
     def log_summary(self, summary: dict):
-        if not self.do.online:
-            return
-        self.run.summary.update(summary)
+        # Log to wandb
+        if self.do.online:
+            self.run.summary.update(summary)
+        # Log to MLflow
+        if self.mlflow is not None:
+            for k, v in summary.items():
+                try:
+                    self.mlflow_logger.log_param(f"summary.{k}", v)
+                except Exception as e:
+                    if self.debug:
+                        print(f"MLflow log_param failed for summary.{k}: {e}")
 
     def save_checkpoint(
         self,
@@ -363,6 +481,13 @@ class Logger:
             "run_id": run_id_ckpt,
         }
         torch.save(checkpoint, ckpt_path)
+        # Log checkpoint to MLflow
+        if self.mlflow is not None:
+            try:
+                self.mlflow.log_artifact(str(ckpt_path))
+            except Exception as e:
+                if self.debug:
+                    print(f"MLflow log_artifact failed: {e}")
 
     def log_time(self, times: dict, use_context: bool):
         if self.do.times:
@@ -370,6 +495,14 @@ class Logger:
             self.log_metrics(times, use_context=use_context)
 
     def end(self):
-        if not self.do.online:
-            return
-        self.wandb.finish()
+        if self.do.online:
+            self.wandb.finish()
+        if self.mlflow is not None:
+            logging.info("Closing MLflow logger...")
+            self.mlflow_logger.close()
+            try:
+                self.mlflow.end_run()
+            except Exception as e:
+                if self.debug:
+                    print(f"MLflow end_run failed: {e}")
+
