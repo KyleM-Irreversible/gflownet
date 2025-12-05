@@ -18,6 +18,216 @@ from gflownet.envs.base import GFlowNetEnv
 from gflownet.utils.common import copy, tfloat, torch2np
 
 
+class SDE(torch.nn.Module):
+    """Abstract class for stochastic differential equations (SDEs).
+
+    Args:
+        object: Inherits from the base object class.
+        epsilon: A small constant for numerical stability denoting the smallest time, i.e. x_0, the zero-noise timestep
+        
+    """
+
+    def __init__(self, epsilon=1e-3, **kwargs):
+        super().__init__() #runs the __init__ of torch.nn.Module
+        self.epsilon = epsilon
+        self.parameters = kwargs.get('sde_parameters', {})  #additional parameters for the SDE
+
+    def get_from_parameters(self, key):
+        return self.parameters[key]
+
+    def sample_prior(self, shape):
+        """Sample from the prior distribution, e.g. the fully-noised distribution.
+
+        Args:
+            shape: The shape of the samples to be generated.
+        Returns:
+            Samples from the prior distribution.
+        """
+        raise NotImplementedError
+
+    def generate_noise_for_step(self, x):
+        """Generate random noise for the current step. This is used in the Euler-Maruyama method.
+        Save it in the object in case we need it for drift or diffusion coefficient."""
+        self.W = torch.randn_like(x)
+
+    def modify_data(self, data, undo=False):
+        """Modify the data to be compatible with the SDE. For example, adding extra channels. 
+        If undo=True, revert the modification."""
+        return data
+    
+    def reset(self, source):
+        """Reset the SDE. Set internal state to source:        
+        """
+        self.x = torch.as_tensor(source)
+        self.x = torch.concat([self.x, torch.ones_like(self.x)*0.5], dim=-1)  #add a sigma channel full of 0.5s
+        self.t = self.epsilon
+
+    def take_action(self, action):
+        dt = self.get_from_parameters('dt')
+        for _ in range(self.get_from_parameters('num_em_steps_per_action')):
+            self.step(dt, drift_injection=action)
+    
+    def step(self, dt, drift_injection=None):
+        """Advance the internal state of the SDE by time step dt.
+
+        Args:
+            dt: The time step.
+
+        Returns:
+            The next state after time step dt.
+        """
+        dx = self._step(self.x, self.t, dt, drift_injection=drift_injection)
+        self.x = self.x + dx
+        self.t = self.t + dt
+        #we can only measure mu_tilde so return that:
+        return self.mu_tilde
+
+
+    def _step(self, x, t, dt, drift_injection=None):
+        """Sample the next state using Euler-Maruyama method and 
+        the correct drift and diffusion, depending on the SDE mode.
+
+        Args:
+            x: The current state.
+            t: The current time.
+            dt: The time step.
+
+        Returns:
+            The next state after time step dt.
+        """
+        #assert torch.is_tensor(dt), "dt must be a torch tensor but got {}: ".format(type(dt))
+        f = self.drift
+        g = self.diffusion
+
+        self.generate_noise_for_step(x) #generates and saves noise in self.W
+
+        z = self.W
+        
+        f_x_t = f(x, t, dt=dt, drift_injection=drift_injection)
+        g_x_t = g(x, t)
+#        if self.debug:
+            #assert not torch.isnan(f_x_t).any(), f"NaNs detected in drift (f(x,t)) during evolution from t={t} to {t+dt}."
+            #assert not torch.isnan(g_x_t).any(), f"NaNs detected in diffusion (g(x,t)) during evolution from t={t} to {t+dt}."
+        
+        #calculate increment
+        dx = f_x_t * dt + g_x_t * torch.sqrt(abs(dt)) * z
+        
+        return dx
+
+    def drift(self, x, t, dt=None, drift_injection=None, **kwargs):
+        """Compute the drift coefficient of the SDE.
+
+        Args:
+            x: The current state.
+            t: The current time.
+
+        Returns:
+            The drift coefficient at state x and time t.
+        """
+        raise NotImplementedError
+    
+    def diffusion(self, x, t, **kwargs):
+        """Compute the diffusion coefficient of the SDE.
+
+        Args:
+            x: The current state.
+            t: The current time.
+
+        Returns:
+            The diffusion coefficient at state x and time t.
+        """
+        raise NotImplementedError
+
+                
+
+class VPSDE(SDE):
+    def __init__(self):
+        super().__init__()
+
+    def drift(self, x, t, dt=None, drift_injection=None, **kwargs):
+        beta = self.get_from_parameters('beta')
+        return -0.5 * beta * x + (drift_injection if drift_injection is not None else 0.0)
+
+    def diffusion(self, x, t, **kwargs):
+        beta = self.get_from_parameters('beta')
+        return torch.sqrt(beta)
+
+
+
+class CIMSDE(SDE):
+    """This is the CIM SDE as defined as Eq. 2 in "Coherent Ising Machines: The Good, The Bad, The Ugly" 
+    by Farhad Khosravi, et al. https://arxiv.org/pdf/2507.14489"""
+    def __init__(self):
+        super().__init__()
+        self.num_variables = 2  #mu and sigma
+        
+
+
+        self.register_buffer('llambda', llambda)
+    
+    def modify_data(self, x, undo=False):
+        if not undo:
+            x = torch.stack([x, 0. * torch.ones_like(x)], dim=-1)  #add a sigma channel full of essentially zeros
+        else:
+            x = x[..., 0]  #remove the sigma channel
+        return x
+
+
+    def drift(self, x, t, dt=None, drift_injection=None, **kwargs):
+        
+        j = self.get_from_parameters('j')
+        p = self.get_from_parameters('p')
+        g = self.get_from_parameters('g')
+        λ = self.get_from_parameters('lambda')
+        
+
+        ### This is a coupled SDE so x is now two dimensional for each data point, e.g.
+        #   x = (batch_size, C, H, W, 2), where the 2 represents [mu, sigma]
+        mu = x[..., 0]
+        sigma = x[..., 1]
+
+        Wt = self.W #we have access to random noise as it will have been generated first
+        #Note: dW/dt = W*sqrt(dt) / dt = W/sqrt(dt)
+        dWdt = Wt / torch.sqrt(dt.abs())
+
+        mu_tilde = mu + torch.sqrt(1/(4*j))*dWdt[..., 0]
+        self.mu_tilde = mu_tilde  #save, as this is the measured "state"
+
+        assert drift_injection is not None, "CIMSDE requires drift_injection to be provided."
+        feedback_term = -λ * drift_injection
+        
+        g2mu2 = g**2 * mu**2
+
+        drift_mu = (-(1+j)+p-g2mu2)*mu + feedback_term
+
+        dsigmaterm1 = 2 * (-(1+j)+p - 3*g2mu2)*sigma
+        dsigmaterm2 = -2*j*(sigma - 0.5)**2
+        dsigmaterm3 = ((1+j) + 2*g2mu2)
+        drift_sigma = dsigmaterm1 + dsigmaterm2 + dsigmaterm3
+
+        drift = torch.stack([drift_mu, drift_sigma], dim=-1)
+        
+
+
+        return drift
+    
+    def diffusion(self, x, t, **kwargs):
+        j = self.get_from_parameters('j')
+        
+
+        sigma = x[..., 1]
+        
+        diffusion_mu = torch.sqrt(j) * (sigma - 0.5)
+        diffusion_sigma = torch.zeros_like(sigma)
+        diffusion = torch.stack([diffusion_mu, diffusion_sigma], dim=-1)
+
+        #assert not torch.isnan(diffusion).any(), "NaNs detected in g(x,t) evaluation during sde.mode={self._sde_mode}"
+
+        return diffusion
+
+
+
+
 class SDEContinuousTorus(GFlowNetEnv):
     r"""
     Continuous hyper-torus environment.
@@ -65,6 +275,15 @@ class SDEContinuousTorus(GFlowNetEnv):
             "vonmises_mean": 0.0,
             "vonmises_concentration": 0.001,
         },
+        sde_params: dict = {
+            "sde_type": "cim",
+            "p": 2.0,
+            "j": 2.0,
+            "g": 0.001,
+            "lambda": 1.0,
+            "dt": 1/100,
+            "num_em_steps_per_action": 10,
+        },
         **kwargs,
     ):
         """
@@ -92,6 +311,8 @@ class SDEContinuousTorus(GFlowNetEnv):
             Dictionary of parameters of the von Mises distribution that defines the
             random distribution of the environment. It must contain two keys with float
             values: ``vonmises_mean`` and ``vonmises_concentration``.
+        sde_params : dict
+            Dictionary of parameters for the stochastic differential equation (SDE)
         """
         assert n_dim > 0
         assert length_traj > 0
@@ -115,6 +336,16 @@ class SDEContinuousTorus(GFlowNetEnv):
             **kwargs,
         )
         self.continuous = True
+
+        self.SDE = SDE(epsilon=0.001, sde_parameters=sde_params)
+
+    def reset(self, *args, **kwargs):
+        """
+        Resets the environment to the source state.
+        """
+        state = super().reset(*args, **kwargs)
+        self.SDE.reset(source=state[:-1])  #exclude n_actions
+        return self
 
     @property
     def mask_dim(self):
@@ -212,31 +443,7 @@ class SDEContinuousTorus(GFlowNetEnv):
             return [False] * 2
 
     def get_mask_invalid_actions_backward(self, state=None, done=None, parents_a=None):
-        """
-        The action is space is continuous, thus the mask is not of invalid actions as
-        in discrete environments, but an indicator of "special cases", for example
-        states from which only certain actions are possible.
-
-        The "mask" has 2 elements to capture the 2 special in backward actions. The
-        possible values of the mask are the following:
-
-        - mask[0]:
-            - True, if only the "return-to-source" action is valid.
-            - False otherwise.
-        - mask[1]:
-            - True, if only the EOS action is valid, that is if done is True.
-            - False otherwise.
-        """
-        if state is None:
-            state = self.state.copy()
-        if done is None:
-            done = self.done
-        if done:
-            return [False, True]
-        elif state[-1] == 1:
-            return [True, False]
-        else:
-            return [False, False]
+        raise NotImplementedError
 
     def get_valid_actions(
         self,
@@ -326,20 +533,19 @@ class SDEContinuousTorus(GFlowNetEnv):
             False, if the action is not allowed for the current state, e.g. stop at the
             root state
         """
-        for dim, angle in enumerate(action):
-            if backward:
-                self.state[int(dim)] -= angle
-            else:
-                self.state[int(dim)] += angle
-            self.state[int(dim)] = self.state[int(dim)] % (2 * np.pi)
+        # for dim, angle in enumerate(action):
+        #     self.state[int(dim)] += angle
+        #     self.state[int(dim)] = self.state[int(dim)] % (2 * np.pi)
+        # self.state[-1] += 1
+        # assert self.state[-1] >= 0 and self.state[-1] <= self.length_traj
+        # # If n_steps is equal to 0, set source to avoid escaping comparison to source.
+        # if self.state[-1] == 0:
+        #     self.state = copy(self.source)
         if backward:
-            self.state[-1] -= 1
-        else:
-            self.state[-1] += 1
-        assert self.state[-1] >= 0 and self.state[-1] <= self.length_traj
-        # If n_steps is equal to 0, set source to avoid escaping comparison to source.
-        if self.state[-1] == 0:
-            self.state = copy(self.source)
+            raise NotImplementedError("Step Backward not implemented for Stochastic Policy.")
+        
+        #MONDAY: TAKE ACTION IN SDE AND SORT OUT THE STATE UPDATE (SEE COMMENTED CODE ABOVE)
+
 
     def step(
         self, action: Tuple[float], skip_mask_check: bool = False
@@ -390,45 +596,7 @@ class SDEContinuousTorus(GFlowNetEnv):
     def step_backwards(
         self, action: Tuple[float], skip_mask_check: bool = False
     ) -> Tuple[List[float], Tuple[float], bool]:
-        """
-        Executes backward step given an action.
-
-        See: _step().
-
-        Args
-        ----
-        action : tuple
-            Action to be executed. An action is a vector where the value at position d
-            indicates the increment in the angle at dimension d.
-
-        skip_mask_check : bool
-            Ignored because the action space space is fully continuous, therefore there
-            is nothing to check.
-
-        Returns
-        -------
-        self.state : list
-            The sequence after executing the action
-
-        action : int
-            Action executed
-
-        valid : bool
-            False, if the action is not allowed for the current state, e.g. stop at the
-            root state
-        """
-        # If done is True, set done to False, increment n_actions and return same state
-        if self.done:
-            assert action == self.eos
-            self.done = False
-            self.n_actions += 1
-            return self.state, action, True
-        # Otherwise perform action
-        else:
-            assert action != self.eos
-            self.n_actions += 1
-            self._step(action, backward=True)
-            return self.state, action, True
+        raise NotImplementedError("Step Backward not implemented for Stochastic Policy.")
 
     def _get_max_trajectory_length(self) -> int:
         """
