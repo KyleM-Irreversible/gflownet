@@ -18,7 +18,7 @@ from gflownet.envs.base import GFlowNetEnv
 from gflownet.utils.common import copy, tfloat, torch2np
 
 
-class ContinuousTorus(GFlowNetEnv):
+class SDEContinuousTorus(GFlowNetEnv):
     r"""
     Continuous hyper-torus environment.
 

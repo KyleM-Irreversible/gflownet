@@ -1,7 +1,7 @@
 defaults:
   - base
 
-_target_: gflownet.envs.sde.SDEContinuousTorus
+_target_: gflownet.envs.sdetorus.SDEContinuousTorus
 
 id: sde
 # Dimensions of hypertorus
