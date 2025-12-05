@@ -19,6 +19,7 @@ from hydra.utils import instantiate
 
 from gflownet.utils.common import load_gflownet_from_rundir, read_hydra_config
 
+CSV = False
 
 @hydra.main(config_path="./config", config_name="eval", version_base="1.1")
 def main(config):
@@ -102,7 +103,7 @@ def main(config):
     tmp_dir = output_dir / "tmp"
     tmp_dir.mkdir(parents=True, exist_ok=True)
 
-    if config.n_samples > 0 and config.n_samples <= 1e5:
+    if config.n_samples > 0 and config.n_samples <= 1e7:
         print(
             f"Sampling {config.n_samples} forward trajectories",
             f"from GFlowNet in batches of {config.sampling_batch_size}",
@@ -117,22 +118,26 @@ def main(config):
                 x_sampled = batch.get_terminating_states(proxy=True)
                 energies = gflownet.proxy(x_sampled)
                 x_sampled = batch.get_terminating_states()
-                df = pd.DataFrame(
-                    {
-                        "readable": [env.state2readable(x) for x in x_sampled],
-                        "energies": energies.tolist(),
-                    }
-                )
-                df.to_csv(tmp_dir / f"gfn_samples_{i}.csv")
+                if CSV:
+                    df = pd.DataFrame(
+                        {
+                            "readable": [env.state2readable(x) for x in x_sampled],
+                            "energies": energies.tolist(),
+                        }
+                    )
+                    
+                    df.to_csv(tmp_dir / f"gfn_samples_{i}.csv")
                 dct = {"x": x_sampled, "energy": energies.tolist()}
                 pickle.dump(dct, open(tmp_dir / f"gfn_samples_{i}.pkl", "wb"))
 
-        # Concatenate all samples
-        print("Concatenating sample CSVs")
-        df = pd.concat(
-            [pd.read_csv(f, index_col=0) for f in tqdm(list(tmp_dir.glob("*.csv")))]
-        )
-        df.to_csv(output_dir / f"{prefix}_samples.csv")
+        if CSV:
+            # Concatenate all samples
+            print("Concatenating sample CSVs")
+            df = pd.concat(
+                [pd.read_csv(f, index_col=0) for f in tqdm(list(tmp_dir.glob("*.csv")))]
+            )
+            df.to_csv(output_dir / f"{prefix}_samples.csv")
+        
         dct = {k: [] for k in dct.keys()}
         for f in tqdm(list(tmp_dir.glob("*.pkl"))):
             tmp_dict = pickle.load(open(f, "rb"))

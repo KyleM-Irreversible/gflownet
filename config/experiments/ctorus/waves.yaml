@@ -5,13 +5,13 @@ defaults:
    - override /gflownet: trajectorybalance
    - override /loss: trajectorybalance
    - override /proxy: torus
-   - override /logger: wandb
+   - override /logger: mlflow
 
 device: cpu
 
 # Environment
 env:
-  n_dim: 2
+  n_dim: 5
   length_traj: 5
   n_comp: 10
   vonmises_min_concentration: 4
@@ -57,10 +57,11 @@ evaluator:
   n: 1000
   checkpoints_period: 1000
 
-# WandB
+# MLFlow
 logger:
   do:
-    online: False
+    mlflow:
+      tracking_uri: http://localhost:9090
   lightweight: True
   project_name: "ctorus"
   run_name: "Waves 3x2"
