@@ -1,0 +1,14 @@
+defaults:
+  - base
+
+_target_: gflownet.utils.logger.Logger
+
+tags:
+    - gflownet
+
+do: 
+  mlflow:
+    tracking_uri: http://localhost:9090
+    sync_interval: 10
+  online: False #disable wandb
+
