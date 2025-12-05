@@ -1,0 +1,2 @@
+alias gfactivate='source ./gflownet-env/bin/activate && conda deactivate'
+alias activate=gfactivate
