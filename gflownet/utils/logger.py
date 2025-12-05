@@ -19,9 +19,10 @@ from torchtyping import TensorType
 
 
 class AsyncMLFlowLogger:
-    def __init__(self, flush_interval=2):
+    def __init__(self, run_name, flush_interval=2):
         import mlflow
         self.mlflow = mlflow
+        self.run_name = run_name
         self.flush_interval = flush_interval
         self.queue = queue.Queue()
         self.stop_flag = False
@@ -62,12 +63,13 @@ class AsyncMLFlowLogger:
 
 
     def worker(self):
-        while not self.stop_flag:
-            try:
-                func, args, kwargs = self.queue.get(timeout=self.flush_interval)
-                func(*args, **kwargs)
-            except queue.Empty:
-                pass
+        with self.mlflow.start_run(run_name=self.run_name) as self.mlflow_run:
+            while not self.stop_flag:
+                try:
+                    func, args, kwargs = self.queue.get(timeout=self.flush_interval)
+                    func(*args, **kwargs)
+                except queue.Empty:
+                    pass
 
     def log_metric(self, key, value, step=None):
         if self.should_log(step):
@@ -162,8 +164,8 @@ class Logger:
                 self.mlflow = mlflow
                 self.mlflow.set_tracking_uri(self.do.mlflow.get("tracking_uri", ""))
                 self.mlflow.set_experiment(project_name)
-                self.mlflow_run = self.mlflow.start_run(run_name=run_name)
-                self.mlflow_logger = AsyncMLFlowLogger()
+                
+                self.mlflow_logger = AsyncMLFlowLogger(run_name=run_name)
 
                 # Log config as params
                 for k, v in config.items():
